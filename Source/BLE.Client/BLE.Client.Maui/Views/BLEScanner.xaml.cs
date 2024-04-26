@@ -10,6 +10,10 @@ public partial class BLEScanner : ContentPage
         _viewModel = new();
         BindingContext = _viewModel;
 
+        ((BLEScannerViewModel) _viewModel).OnMessageAdded = ()=> {
+            messagesCollectionView.ScrollTo(0);
+        };
+
     }
 
 }

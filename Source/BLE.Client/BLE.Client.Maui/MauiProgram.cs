@@ -1,4 +1,5 @@
 ﻿using BLE.Client.Maui.Services;
+using CommunityToolkit.Maui;
 namespace BLE.Client.Maui;
 
 public static class MauiProgram
@@ -8,6 +9,7 @@ public static class MauiProgram
 		var builder = MauiApp.CreateBuilder();
 		builder
 			.UseMauiApp<App>()
+			.UseMauiCommunityToolkit()
 			.ConfigureFonts(fonts =>
 			{
 				fonts.AddFont("OpenSans-Regular.ttf", "OpenSansRegular");

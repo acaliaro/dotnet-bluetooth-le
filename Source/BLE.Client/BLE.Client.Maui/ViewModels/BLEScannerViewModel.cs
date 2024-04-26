@@ -1,6 +1,12 @@
 ﻿using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
+using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Windows.Input;
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
 using Plugin.BLE;
 using Plugin.BLE.Abstractions.Contracts;
 using Plugin.BLE.Abstractions.EventArgs;
@@ -8,63 +14,130 @@ using Plugin.BLE.Abstractions.Extensions;
 
 namespace BLE.Client.Maui.ViewModels
 {
-    public class BLEScannerViewModel : BaseViewModel
+    public partial class BLEScannerViewModel : ObservableObject
     {
-        private readonly IBluetoothLE _bluetoothManager;
-        protected IAdapter Adapter;
+        private const string ConfigurationBleService = "04000000-e814-4b55-bbca-2c58013d29f8";
+        private const string ConfigurationCharWrite = "04010000-e814-4b55-bbca-2c58013d29f8";
+        private const string ConfigurationCharIndication = "04020000-e814-4b55-bbca-2c58013d29f8";
+        private CancellationTokenSource _cancellationToken;
+        private ICharacteristic _configurationIndicationChar;
+        private ICharacteristic _configurationWriteChar;
+        protected IService ConfigurationService;
+        [ObservableProperty]
+        bool _permissionsGranted;
 
-        public ObservableCollection<BLEDeviceViewModel> BLEDevices { get; private init; } = [];
+        IDispatcherTimer timer = Application.Current.Dispatcher.CreateTimer();
 
+        [ObservableProperty]
+        [NotifyPropertyChangedFor(nameof(IsStateOn))]
+        private IBluetoothLE _bluetoothManager;
+
+        private IAdapter Adapter;
+
+        [ObservableProperty]
+        bool _isStateOn;
+        [ObservableProperty]
+        string _stateText;
+        [ObservableProperty]
+        bool _isRefreshing;
+        [ObservableProperty]
+        bool _isConnected;
+
+        CancellationTokenSource _scanCancellationTokenSource = new();
+        readonly CancellationToken _scanCancellationToken;
+
+        [ObservableProperty]
         private bool _isScanning = false;
-        public bool IsScanning
-        {
-            get => _isScanning;
-            protected set
-            {
-                if (_isScanning != value) {
-                    _isScanning = value;
-                    DebugMessage($"Set IsScanning to {value}");
-                    RaisePropertyChanged(nameof(IsScanning));
-                    RaisePropertyChanged(nameof(Waiting));
-                    RaisePropertyChanged(nameof(ScanState));
-                    RaisePropertyChanged(nameof(ToggleScanningCmdLabelText));
-                }
-            }
-        }
 
-        #region Derived properties
-        public bool IsStateOn => _bluetoothManager.IsOn;
-        public string StateText => GetStateText();
-        public bool Waiting => !_isScanning;
-        public string ScanState => IsScanning ? "Scanning" : "Waiting";
-        public string ToggleScanningCmdLabelText => IsScanning ? "Cancel" : "Start Scan";
-        #endregion Derived properties
+        [ObservableProperty]
+        BLEDeviceViewModel _selectedItem;
+
+        [ObservableProperty]
+        public ObservableCollection<BLEDeviceViewModel> _bLEDevices = [];
+        [ObservableProperty]
+        private ObservableCollection<string> _messages = [];
+        [ObservableProperty]
+        string _scanState;
+        [ObservableProperty]
+        string _scanLabelText = "Start Scan";
+
 
         public BLEScannerViewModel()
         {
-            _bluetoothManager = CrossBluetoothLE.Current;
-            Adapter = _bluetoothManager?.Adapter;
+            DebugMessage($"Into BLEScannerViewModel constructor");
+            _scanCancellationToken = _scanCancellationTokenSource.Token;
+            ConfigureBLE();
 
-            if (_bluetoothManager is null)
+            timer.Interval = TimeSpan.FromSeconds(5);
+            timer.Tick += (s, e) =>
             {
-                ShowMessage("BluetoothManager is null");
-            }
-            else if (Adapter is null)
+                if (!_canWrite)
+                    return;
+
+                byte[] buffer = GetEVSEVerboseStateRequest();
+
+                MainThread.BeginInvokeOnMainThread(async () =>
+                {
+                    try
+                    {
+                        DebugMessage("---> SEND " + BitConverter.ToString(buffer) + " counter = " + countTimer);
+                        countTimer++;
+
+                        await _configurationWriteChar.WriteAsync(buffer);
+                        _canWrite = false;
+                    }
+                    catch (Exception ex)
+                    {
+                        DebugMessage(ex.Message);
+                    }
+                });
+
+            };
+
+            MainThread.InvokeOnMainThreadAsync(async () =>
             {
-                ShowMessage("Adapter is null");
-            }
-            else
-            {
-                ConfigureBLE();
-            }
-            
-            ToggleScanning = new Command(ToggleScanForDevices);
+                PermissionsGranted = await CheckCorrectPermissionsAsync();
+            });
         }
 
+        [RelayCommand]
+        async Task GrantPermissionsAsync()
+        {
+            try
+            {
+                if (await CheckCorrectPermissionsAsync() == false)
+                    await AskCorrectPermissionsAsync();
+            }
+            catch (Exception ex)
+            {
+                DebugMessage(ex.Message);
+            }
+        }
+
+
+        partial void OnIsScanningChanged(bool value)
+        {
+            ScanState = value ? "Scanning" : "Waiting";
+            DebugMessage($"Getting ScanState: '{ScanState}'");
+
+            ScanLabelText = value ? "Cancel" : "Start Scan";
+            DebugMessage($"Getting ScanLabelText: '{ScanLabelText}'");
+        }
+
+        private void ClearMessages()
+        {
+            DebugMessage($"enter ClearMessages");
+            Messages.Clear();
+            DebugMessage($"exit ClearMessages");
+        }
         private string GetStateText()
         {
+            DebugMessage("Into GetState");
             var result = "Unknown BLE state.";
-            switch (_bluetoothManager.State)
+
+            IsStateOn = BluetoothManager.IsOn;
+
+            switch (BluetoothManager.State)
             {
                 case BluetoothState.Unknown:
                     result = "Unknown BLE state.";
@@ -88,6 +161,8 @@ namespace BLE.Client.Maui.ViewModels
                     result = "BLE is off. Turn it on!";
                     break;
             }
+            DebugMessage($"return state as '{result}'");
+
             return result;
         }
 
@@ -100,141 +175,316 @@ namespace BLE.Client.Maui.ViewModels
         private void DebugMessage(string message)
         {
             Debug.WriteLine(message);
-            App.Logger.AddMessage(message);
+            Messages.Insert(0, message);
+            OnMessageAdded?.Invoke();
         }
+
+        public Action OnMessageAdded;
 
         private void ConfigureBLE()
         {
-            DebugMessage("Configuring BLE...");
-            _bluetoothManager.StateChanged += OnBluetoothStateChanged;
+            DebugMessage("into ConfigureBLE");
+            BluetoothManager = CrossBluetoothLE.Current;
+            DebugMessage("got _bluetoothManager");
+            if (BluetoothManager == null)
+            {
+                DebugMessage("CrossBluetoothLE.Current is null");
+            }
+            else
+            {
+                BluetoothManager.StateChanged += OnStateChanged;
+            }
 
-            // Set up scanner
-            Adapter.ScanMode = ScanMode.LowLatency;
-            Adapter.ScanTimeout = 30000; // ms
-            Adapter.ScanTimeoutElapsed += Adapter_ScanTimeoutElapsed;
-            Adapter.DeviceAdvertised += OnDeviceAdvertised;
-            Adapter.DeviceDiscovered += OnDeviceDiscovered;
-            DebugMessage("Configuring BLE... DONE");
+            Adapter = CrossBluetoothLE.Current.Adapter;
+            if (Adapter == null)
+            {
+                DebugMessage("CrossBluetoothLE.Current.Adapter is null");
+            }
+            else
+            {
+                DebugMessage("go and set event handlers");
+
+                AddAdapterEvents();
+
+                Adapter.ScanMode = ScanMode.LowLatency;
+
+                DebugMessage("event handlers set");
+            }
+
+            if (BluetoothManager == null && Adapter == null)
+            {
+                ShowMessage("Bluetooth and Adapter are both null");
+            }
+            else if (BluetoothManager == null)
+            {
+                ShowMessage("Bluetooth is null");
+            }
+            else if (Adapter == null)
+            {
+                ShowMessage("Adapter is null");
+            }
         }
-        private void OnBluetoothStateChanged(object sender, BluetoothStateChangedArgs e)
+
+        private async void OnDeviceConnectionError(object sender, DeviceErrorEventArgs e)
         {
-            DebugMessage("OnBluetoothStateChanged from " + e.OldState + " to " + e.NewState);
-            RaisePropertyChanged(nameof(IsStateOn));
-            RaisePropertyChanged(nameof(StateText));
+            DebugMessage("OnDeviceConnectionError");
+            await StopBleCommunicationAsync();
         }
 
-        #region Scan & Discover
-        public ICommand ToggleScanning { get; init; }
-        CancellationTokenSource _scanCancellationTokenSource = null;
+        private async void OnDeviceConnectionLost(object sender, DeviceErrorEventArgs e)
+        {
+            DebugMessage("OnDeviceConnectionLost");
+            await StopBleCommunicationAsync();
+        }
+
+        private async void OnDeviceDisconnected(object sender, DeviceEventArgs e)
+        {
+            DebugMessage("OnDeviceDisconnected");
+            await StopBleCommunicationAsync();
+        }
+
+        private byte[] GetMessageBytes(ushort command, byte[] payloadBytes)
+        {
+            var head = HeadBytes();
+            var commandBytes = BitConverter.GetBytes(command);
+            var len = BitConverter.GetBytes((ushort)payloadBytes.Length);
+            var dataArray = head.Concat(commandBytes).Concat(len).Concat(payloadBytes);
+            var crc = Calc_CRC_8(dataArray.ToArray(), dataArray.Count());
+            return dataArray.Append(crc).ToArray();
+        }
+
+        private static byte[] HeadBytes()
+        {
+            return new byte[] { 0xda, 0x2e, };
+        }
+
+        public static byte Calc_CRC_8(byte[] addr, int len)
+        {
+            byte crc = 0;
+            for (int i = 0; i < len; i++)
+            {
+                byte inbyte = addr[i];
+                for (int j = 0; j < 8; j++)
+                {
+                    byte mix = (byte)((byte)(crc ^ inbyte) & 0x01);
+                    crc >>= 1;
+                    if (mix != 0)
+                        crc ^= 0x8C;
+                    inbyte >>= 1;
+                }
+            }
+
+            return crc;
+        }
+
+        public byte[] GetEVSEVerboseStateRequest()
+        {
+            return MessageWithEmptyPayload(0x1220);
+        }
+
+        private byte[] MessageWithEmptyPayload(ushort command)
+        {
+            return GetMessageBytes(command, Array.Empty<byte>());
+        }
+
+        int countTimer = 1;
+        private async void OnDeviceConnected(object sender, DeviceEventArgs e)
+        {
+            DebugMessage("OnDeviceConnected");
+
+            await StartBleCommunicationAsync(e);
+        }
+
+        bool _canWrite = false;
+
+        private async Task StartBleCommunicationAsync(DeviceEventArgs e)
+        {
+            IsConnected = true;
+
+            ConfigurationService = await e.Device.GetServiceAsync(Guid.Parse(ConfigurationBleService));
+            _configurationWriteChar = await ConfigurationService.GetCharacteristicAsync(Guid.Parse(ConfigurationCharWrite));
+            _configurationIndicationChar = await ConfigurationService.GetCharacteristicAsync(Guid.Parse(ConfigurationCharIndication));
+
+            _configurationIndicationChar.ValueUpdated -= OnConfigurationIndicationCharOnValueUpdated;
+
+            _configurationIndicationChar.ValueUpdated += OnConfigurationIndicationCharOnValueUpdated;
+            await _configurationIndicationChar.StartUpdatesAsync();
+
+            await Task.Delay(1000);
+            countTimer = 1;
+            timer.Start();
+            _canWrite = true;
+
+
+            BLEDevices.Clear();
+        }
+
+        private async Task StopBleCommunicationAsync()
+        {
+            timer.Stop();
+            IsConnected = false;
+
+            SelectedItem = null;
+
+            if (_configurationIndicationChar != null)
+            {
+                try
+                {
+                    await _configurationIndicationChar.StopUpdatesAsync();
+                    _configurationIndicationChar.ValueUpdated -= OnConfigurationIndicationCharOnValueUpdated;
+                }
+                catch (Exception ex)
+                {
+
+                    DebugMessage("StopBleCommunicationAsync exception = " + ex.Message);
+                }
+            }
+
+        }
+
+        private void OnConfigurationIndicationCharOnValueUpdated(object sender, CharacteristicUpdatedEventArgs e)
+        {
+            if (e != null && e.Characteristic.Value.Length != 0)
+            {
+                DebugMessage("<--- RECV " + BitConverter.ToString(e.Characteristic.Value));
+                _canWrite = true;
+            }
+        }
+
+        private void OnStateChanged(object sender, BluetoothStateChangedArgs e)
+        {
+
+            DebugMessage("OnStateChanged");
+
+            StateText = GetStateText();
+
+            DebugMessage("OnStateChanged done");
+        }
 
         private void Adapter_ScanTimeoutElapsed(object sender, EventArgs e)
         {
             DebugMessage("Adapter_ScanTimeoutElapsed");
-            // Cleanup will happen inside ScanForDevicesAsync
+            IsRefreshing = Adapter?.IsScanning ?? false;
+            CleanupCancellationToken();
+            DebugMessage("Adapter_ScanTimeoutElapsed done");
         }
 
-        private void OnDeviceAdvertised(object sender, DeviceEventArgs args)
-        {
-            DebugMessage("OnDeviceAdvertised");
-            AddOrUpdateDevice(args.Device);
-            DebugMessage("OnDeviceAdvertised done");
-        }
         private void OnDeviceDiscovered(object sender, DeviceEventArgs args)
         {
             DebugMessage("OnDeviceDiscovered");
             AddOrUpdateDevice(args.Device);
+
+            if (args.Device.NativeDevice != null && args.Device.Name != null)
+            {
+                DebugMessage("OnDeviceDiscovered args.Device.Name = " + args.Device.Name);
+
+                var device = args.Device;
+                var nativeDevice = args.Device.NativeDevice;
+
+                var advertisementRecords = device.AdvertisementRecords;
+
+                DebugMessage("OnDeviceDiscovered device.GetType() = " + device.GetType());
+                DebugMessage("OnDeviceDiscovered nativeDevice.GetType() = " + nativeDevice.GetType());
+                if (advertisementRecords != null)
+                {
+                    DebugMessage("OnDeviceDiscovered advertisementRecords.GetType() = " + advertisementRecords.GetType());
+                    DebugMessage("OnDeviceDiscovered advertisementRecords.Count = " + advertisementRecords.Count);
+
+                    foreach (var r in advertisementRecords)
+                    {
+                        if (r.Type == Plugin.BLE.Abstractions.AdvertisementRecordType.ShortLocalName)
+                        {
+                            string bitString = BitConverter.ToString(r.Data);
+
+                            DebugMessage("OnDeviceDiscovered advertisementRecords.ShortLocalName = " + bitString);
+
+                        }
+                        else if (r.Type == Plugin.BLE.Abstractions.AdvertisementRecordType.CompleteLocalName)
+                        {
+                            string bitString = BitConverter.ToString(r.Data);
+
+                            DebugMessage("OnDeviceDiscovered advertisementRecords.CompleteLocalName = " + bitString);
+                        }
+                    }
+                }
+
+            }
+
             DebugMessage("OnDeviceDiscovered done");
         }
 
         private void AddOrUpdateDevice(IDevice device)
         {
-            MainThread.BeginInvokeOnMainThread(() => {
-                var vm = BLEDevices.FirstOrDefault(d => d.DeviceId == device.Id);
-                if (vm != null)
-                {
-                    DebugMessage($"Update Device: {device.Id}");
-                    vm.Update(device);
-                }
-                else
+            DebugMessage($"Device Found: '{device.Id}'");
+            var vm = BLEDevices.FirstOrDefault(d => d.DeviceId == device.Id);
+            if (vm != null)
+            {
+                DebugMessage($"Update Device: {device.Id}");
+            }
+            else
+            {
+                if (device != null && device.Name != null && device.Name.ToUpper().StartsWith("DAZE"))
                 {
                     DebugMessage($"Add Device: {device.Id}");
                     vm = new BLEDeviceViewModel(device);
-                    BLEDevices.Add(vm);
+                    MainThread.BeginInvokeOnMainThread(() => BLEDevices.Add(vm));
                 }
-            });
+            }
+            DebugMessage($"Device Found: '{device.Id}' done");
         }
 
-        private void ToggleScanForDevices()
+        private void CleanupCancellationToken()
         {
+            DebugMessage("CleanUpCancellationToken");
+            _scanCancellationTokenSource.Dispose();
+            _scanCancellationTokenSource = null;
+            IsScanning = false;
+            DebugMessage("CleanUpCancellationToken done");
+        }
+
+        [RelayCommand]
+        async Task DisconnectAsync()
+        {
+            if (SelectedItem != null)
+            {
+                await Adapter.DisconnectDeviceAsync(SelectedItem.CurrentDevice);
+            }
+        }
+
+        [RelayCommand]
+        async Task SelectDeviceAsync()
+        {
+
+            if (SelectedItem != null)
+            {
+                await Adapter.ConnectToDeviceAsync(SelectedItem.CurrentDevice);
+            }
+        }
+
+        [RelayCommand]
+        async Task ScanForDevicesAsync()
+        {
+            ClearMessages();
             if (!IsScanning)
             {
                 IsScanning = true;
                 DebugMessage($"Starting Scanning");
-                ScanForDevicesAsync();
+                StartScanForDevices();
                 DebugMessage($"Started Scan");
             }
             else
             {
-                DebugMessage($"Request Stopping Scan");
-                _scanCancellationTokenSource?.Cancel();
-                DebugMessage($"Stop Scanning Requested");
-            }
-        }
-        private async void ScanForDevicesAsync()
-        {
-            if (!IsStateOn)
-            {
-                ShowMessage("Bluetooth is not ON.\nPlease turn on Bluetooth and try again.");
+                DebugMessage($"Stopping Scan");
+                _scanCancellationTokenSource.Cancel();
                 IsScanning = false;
-                return;
+                DebugMessage($"Stop Scanning");
             }
-            if (!await HasCorrectPermissions())
-            {
-                DebugMessage("Aborting scan attempt");
-                IsScanning = false;
-                return;
-            }
-            DebugMessage("StartScanForDevices called");
-            BLEDevices.Clear();
-            await UpdateConnectedDevices();
-
-            _scanCancellationTokenSource = new();
-
-            DebugMessage("call Adapter.StartScanningForDevicesAsync");
-            await Adapter.StartScanningForDevicesAsync(_scanCancellationTokenSource.Token);
-            DebugMessage("back from Adapter.StartScanningForDevicesAsync");
-
-            // Scanning stopped (for whichever reason) -> cleanup
-            _scanCancellationTokenSource.Dispose();
-            _scanCancellationTokenSource = null;
-            IsScanning = false;
         }
-
-        private async Task<bool> HasCorrectPermissions()
-        {
-            DebugMessage("Verifying Bluetooth permissions..");
-            var permissionResult = await Permissions.CheckStatusAsync<Permissions.Bluetooth>();
-            if (permissionResult != PermissionStatus.Granted)
-            {
-                permissionResult = await Permissions.RequestAsync<Permissions.Bluetooth>();
-            }
-            DebugMessage($"Result of requesting Bluetooth permissions: '{permissionResult}'");
-            if (permissionResult != PermissionStatus.Granted)
-            {
-                DebugMessage("Permissions not available, direct user to settings screen.");
-                ShowMessage("Permission denied. Not scanning.");
-                AppInfo.ShowSettingsUI();
-                return false;
-            }
-
-            return true;
-        }
-
         private async Task UpdateConnectedDevices()
         {
             foreach (var connectedDevice in Adapter.ConnectedDevices)
             {
-                //update rssi for already connected devices (so that 0 is not shown in the list)
+                //update rssi for already connected devices (so tha 0 is not shown in the list)
                 try
                 {
                     await connectedDevice.UpdateRssiAsync();
@@ -248,6 +498,86 @@ namespace BLE.Client.Maui.ViewModels
             }
         }
 
-        #endregion Scan & Discover
+        private async void StartScanForDevices()
+        {
+            DebugMessage("into StartScanForDevices");
+            if (!await CheckCorrectPermissionsAsync())
+            {
+                if (!await AskCorrectPermissionsAsync())
+                {
+                    DebugMessage("Permissons fail - can't scan");
+                    return;
+                }
+            }
+
+            DebugMessage("StartScanForDevices called");
+            BLEDevices.Clear();
+            await UpdateConnectedDevices();
+            OnPropertyChanged(nameof(BLEDevices));
+
+            _scanCancellationTokenSource = new CancellationTokenSource();
+            Adapter.ScanMode = ScanMode.LowLatency;
+
+
+            RemoveAdapterEvents();
+            AddAdapterEvents();
+
+            Adapter.ScanMode = ScanMode.LowLatency;
+
+            DebugMessage("call Adapter.StartScanningForDevicesAsync");
+            await Adapter.StartScanningForDevicesAsync(_scanCancellationTokenSource.Token);
+            DebugMessage("back from Adapter.StartScanningForDevicesAsync");
+        }
+
+        private void AddAdapterEvents()
+        {
+            Adapter.DeviceDiscovered += OnDeviceDiscovered;
+            Adapter.DeviceAdvertised += OnDeviceDiscovered;
+            Adapter.ScanTimeoutElapsed += Adapter_ScanTimeoutElapsed;
+            Adapter.DeviceConnected += OnDeviceConnected;
+            Adapter.DeviceDisconnected += OnDeviceDisconnected;
+            Adapter.DeviceConnectionLost += OnDeviceConnectionLost;
+            Adapter.DeviceConnectionError += OnDeviceConnectionError;
+        }
+
+        private void RemoveAdapterEvents()
+        {
+            Adapter.DeviceDiscovered -= OnDeviceDiscovered;
+            Adapter.DeviceAdvertised -= OnDeviceDiscovered;
+            Adapter.ScanTimeoutElapsed -= Adapter_ScanTimeoutElapsed;
+            Adapter.DeviceConnected -= OnDeviceConnected;
+            Adapter.DeviceDisconnected -= OnDeviceDisconnected;
+            Adapter.DeviceConnectionLost -= OnDeviceConnectionLost;
+            Adapter.DeviceConnectionError -= OnDeviceConnectionError;
+        }
+
+
+
+        private async Task<bool> AskCorrectPermissionsAsync()
+        {
+            DebugMessage("Into AskCorrectPermissionsAsync");
+            var permissionResult = await Permissions.RequestAsync<Permissions.Bluetooth>();
+            DebugMessage($"Back from await App.PlatformHelper: '{permissionResult}'");
+            if (permissionResult != PermissionStatus.Granted)
+            {
+                DebugMessage($"!!Permissions denied!! '{permissionResult}'");
+                ShowMessage("Permission denied. Not scanning.");
+                AppInfo.ShowSettingsUI();
+                return false;
+            }
+
+            DebugMessage("Exit AskCorrectPermissionsAsync");
+            return true;
+        }
+
+        private async Task<bool> CheckCorrectPermissionsAsync()
+        {
+            DebugMessage("Into CheckCorrectPermissionsAsync");
+            var permissionResult = await Permissions.CheckStatusAsync<Permissions.Bluetooth>();
+
+            DebugMessage("Exit CheckCorrectPermissionsAsync");
+            return permissionResult != PermissionStatus.Granted;
+        }
+
     }
 }
